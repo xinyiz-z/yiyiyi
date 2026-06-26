@@ -1,1 +1,651 @@
+# -*- coding: utf-8 -*-
+# @Time : 2025/4/25 上午10:14
+# @Author : dameng
+# @File : Boss_job.py
+# @software : PyCharm
+
+import argparse
+import csv
+import json
+import time
+import random
+import traceback
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+from DrissionPage import Chromium
+
+DEFAULT_CITY_NAME = "全国"
+DEFAULT_CITY_CODE = "100010000"
+DEFAULT_KEYWORD = "计算机"
+CITY_JSON_NAME = "城市代码.json"
+PACKET_TIMEOUT = 8
+SCROLL_PAUSE = random.uniform(1.5,2)
+MAX_EMPTY_SCROLLS = 3
+MAX_SCROLL_ROUNDS = 0
+CSV_FIELDS = [
+    "job_id",
+    "job_name",
+    "salary",
+    "job_labels",
+    "job_experience",
+    "job_degree",
+    "city_name",
+    "area_district",
+    "business_district",
+    "brand_name",
+    "brand_scale",
+    "brand_stage",
+    "skills",
+    "welfare_list",
+    "boss_name",
+    "boss_title",
+    "job_description",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="抓取 BOSS 直聘无限下拉职位数据，支持城市选择、关键词输入和断点续抓。"
+    )
+    parser.add_argument("--keyword", default=None, help="岗位关键词，不传则交互输入，默认：计算机")
+    parser.add_argument("--company", default=None, help="公司名称，不传则交互输入，与关键词二选一")
+    parser.add_argument("--city", default=None, help="城市名称或城市代码，不传则交互输入，默认：全国")
+    parser.add_argument(
+        "--output-prefix",
+        default=None,
+        help="输出文件前缀，不传则自动按 boss_jobs_关键词 生成",
+    )
+    parser.add_argument(
+        "--packet-timeout",
+        type=int,
+        default=PACKET_TIMEOUT,
+        help="等待接口返回的超时时间，单位秒",
+    )
+    parser.add_argument(
+        "--scroll-pause",
+        type=float,
+        default=SCROLL_PAUSE,
+        help="每次下拉后的等待时间，单位秒",
+    )
+    parser.add_argument(
+        "--max-empty-scrolls",
+        type=int,
+        default=MAX_EMPTY_SCROLLS,
+        help="连续多少次下拉没有抓到新包时停止",
+    )
+    parser.add_argument(
+        "--max-scroll-rounds",
+        type=int,
+        default=MAX_SCROLL_ROUNDS,
+        help="最大下拉轮次，0 表示不限制。注意这不是固定页码，而是向下滚动的次数。",
+    )
+    parser.add_argument(
+        "--fetch-description",
+        action="store_true",
+        help="抓取职位详情描述（会增加抓取时间）",
+    )
+    return parser.parse_args()
+
+
+def find_city_json_path():
+    base_dir = Path(__file__).parent
+    direct_path = base_dir / CITY_JSON_NAME
+    if direct_path.exists():
+        return direct_path
+
+    for path in base_dir.glob("*.json"):
+        try:
+            data = load_json_file(path)
+        except Exception:
+            continue
+        if isinstance(data, dict) and "zpData" in data and "siteList" in data["zpData"]:
+            return path
+
+    raise FileNotFoundError(f"未找到城市代码文件：{CITY_JSON_NAME}")
+
+
+def load_json_file(path):
+    for encoding in ("utf-8", "utf-8-sig", "gbk"):
+        try:
+            return json.loads(path.read_text(encoding=encoding))
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("unknown", b"", 0, 1, f"无法识别文件编码：{path}")
+
+
+def collect_city_entries(node, result):
+    if isinstance(node, dict):
+        name = str(node.get("name", "")).strip()
+        code = node.get("code")
+        if name and code is not None:
+            result.append((name, str(code)))
+
+        for value in node.values():
+            collect_city_entries(value, result)
+    elif isinstance(node, list):
+        for item in node:
+            collect_city_entries(item, result)
+
+
+def load_city_book():
+    path = find_city_json_path()
+    data = load_json_file(path)
+    entries = []
+    collect_city_entries(data.get("zpData", {}), entries)
+
+    name_to_code = {DEFAULT_CITY_NAME: DEFAULT_CITY_CODE}
+    code_to_name = {DEFAULT_CITY_CODE: DEFAULT_CITY_NAME}
+
+    for name, code in entries:
+        if name not in name_to_code:
+            name_to_code[name] = code
+        if code not in code_to_name:
+            code_to_name[code] = name
+
+    hot_city_names = []
+    for item in data.get("zpData", {}).get("hotCitySites", []):
+        name = str(item.get("name", "")).strip()
+        if name and name not in hot_city_names:
+            hot_city_names.append(name)
+
+    return {
+        "path": path,
+        "name_to_code": name_to_code,
+        "code_to_name": code_to_name,
+        "hot_city_names": hot_city_names,
+    }
+
+
+def prompt_keyword(args):
+    if args.keyword is not None:
+        value = args.keyword.strip()
+        return value or DEFAULT_KEYWORD
+
+    value = input(f"请输入岗位关键词，直接回车默认 {DEFAULT_KEYWORD}：").strip()
+    return value or DEFAULT_KEYWORD
+
+
+def prompt_company(args):
+    if args.company is not None:
+        return args.company.strip()
+
+    return input("请输入公司名称：").strip()
+
+
+def resolve_city(raw_value, city_book):
+    value = raw_value.strip()
+    if not value:
+        return DEFAULT_CITY_NAME, DEFAULT_CITY_CODE
+
+    if value.isdigit():
+        return city_book["code_to_name"].get(value, value), value
+
+    if value in city_book["name_to_code"]:
+        return value, city_book["name_to_code"][value]
+
+    candidates = [name for name in city_book["name_to_code"] if value in name]
+    if len(candidates) == 1:
+        name = candidates[0]
+        return name, city_book["name_to_code"][name]
+
+    if candidates:
+        preview = "、".join(candidates[:10])
+        raise ValueError(f"未找到精确城市名，可能是：{preview}")
+
+    raise ValueError("未找到该城市，请输入城市名称或城市代码。")
+
+
+def prompt_city(args, city_book, preset_city=None):
+    raw_city = args.city if preset_city is None else preset_city
+    if raw_city is not None:
+        return resolve_city(raw_city, city_book)
+
+    hot_city_text = "、".join(city_book["hot_city_names"][:12])
+    if hot_city_text:
+        print(f"热门城市示例：{hot_city_text}")
+
+    while True:
+        value = input(f"请输入城市名称或城市代码，直接回车默认 {DEFAULT_CITY_NAME}：").strip()
+        try:
+            return resolve_city(value, city_book)
+        except ValueError as error:
+            print(error)
+
+
+def sanitize_filename(text):
+    banned = '<>:"/\\|?*'
+    cleaned = []
+    for char in text:
+        if char in banned:
+            cleaned.append("_")
+        elif char.isspace():
+            cleaned.append("_")
+        else:
+            cleaned.append(char)
+    result = "".join(cleaned).strip("._")
+    return result or "boss_jobs"
+
+
+def build_output_prefix(args, keyword):
+    if args.output_prefix:
+        return args.output_prefix
+
+    return f"boss_jobs_{sanitize_filename(keyword)}"
+
+
+def resolve_output_base(output_prefix):
+    base = Path(output_prefix)
+    if base.suffix:
+        base = base.with_suffix("")
+    if not base.is_absolute():
+        base = Path(__file__).parent / base
+    base.parent.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def build_paths(output_base):
+    return {
+        "base": output_base,
+        "csv": output_base.with_suffix(".csv"),
+        "log": output_base.with_suffix(".log"),
+    }
+
+
+def build_target_url(keyword, city_code, company=None):
+    encoded_keyword = quote(keyword) if keyword else quote(company)
+    if company:
+        query_part = f"query={quote(company)}"
+    else:
+        query_part = f"query={encoded_keyword}"
+    return (
+        "https://www.zhipin.com/web/geek/jobs"
+        f"?{query_part}&city={city_code}&industry=&position="
+    )
+
+
+def ensure_not_blocked(tab):
+    current_url = tab.url
+    if "security.html" in current_url or "code=37" in current_url:
+        raise RuntimeError("已跳转到安全验证页，请先在浏览器中完成验证后再重试。")
+
+
+def parse_packet(packet):
+    if not packet:
+        return [], None
+
+    res = packet.response.body
+    if isinstance(res, str):
+        if '"code":37' in res:
+            raise RuntimeError("当前会话已被风控拦截。")
+        return [], None
+
+    if not isinstance(res, dict):
+        return [], None
+
+    code = res.get("code")
+    if code not in (None, 0):
+        raise RuntimeError(f"接口返回异常状态码：{code}")
+
+    data = res.get("zpData") or {}
+    return data.get("jobList") or [], bool(data.get("hasMore"))
+
+
+def normalize_job(item):
+    return {
+        "job_id": item.get("encryptJobId") or item.get("securityId", ""),
+        "job_name": item.get("jobName", ""),
+        "salary": item.get("salaryDesc", ""),
+        "job_labels": " | ".join(item.get("jobLabels") or []),
+        "job_experience": item.get("jobExperience", ""),
+        "job_degree": item.get("jobDegree", ""),
+        "city_name": item.get("cityName", ""),
+        "area_district": item.get("areaDistrict", ""),
+        "business_district": item.get("businessDistrict", ""),
+        "brand_name": item.get("brandName", ""),
+        "brand_scale": item.get("brandScaleName", ""),
+        "brand_stage": item.get("brandStageName", ""),
+        "skills": " | ".join(item.get("skills") or []),
+        "welfare_list": " | ".join(item.get("welfareList") or []),
+        "boss_name": item.get("bossName", ""),
+        "boss_title": item.get("bossTitle", ""),
+        "job_description": "",
+    }
+
+
+def parse_job_detail_packet(packet):
+    if not packet:
+        print("  packet为空")
+        return None
+
+    res = packet.response.body
+    print(f"  响应类型: {type(res)}, 是否字符串: {isinstance(res, str)}")
+    if isinstance(res, str):
+        if '"code":37' in res:
+            print("  被风控拦截")
+        return None
+
+    if not isinstance(res, dict):
+        return None
+
+    code = res.get("code")
+    print(f"  响应code: {code}")
+    if code not in (None, 0):
+        return None
+
+    data = res.get("zpData") or {}
+    description = data.get("jobDetail", {}).get("description", "") or ""
+    print(f"  原始description长度: {len(description)}")
+    return description
+
+
+def fetch_job_description(tab, job_id, timeout=5):
+    try:
+        reset_listener(tab)
+        tab.listen.start("job_detail.json")
+        job_url = f"https://www.zhipin.com/web/geek/job/{job_id}.html"
+        print(f"  访问URL: {job_url}")
+        tab.get(job_url)
+        packet = tab.listen.wait(timeout=timeout)
+        description = parse_job_detail_packet(packet)
+        print(f"  获取到描述长度: {len(description) if description else 0}")
+        return description
+    except Exception as e:
+        print(f"  获取失败: {e}")
+        return ""
+    finally:
+        try:
+            tab.listen.stop()
+        except Exception:
+            pass
+
+
+def load_existing_jobs(paths):
+    csv_path = paths["csv"]
+    if csv_path.exists():
+        for encoding in ("utf-8-sig", "utf-8", "gbk"):
+            try:
+                with csv_path.open("r", newline="", encoding=encoding) as file:
+                    reader = csv.DictReader(file)
+                    normalized_rows = []
+                    for row in reader:
+                        if not isinstance(row, dict):
+                            continue
+                        normalized_rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+                    return normalized_rows
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                print(f"检测到已有 CSV 文件损坏，将尝试读取旧的 JSON 缓存：{csv_path}")
+                break
+        else:
+            print(f"无法识别已有 CSV 文件编码，将尝试读取旧的 JSON 缓存：{csv_path}")
+
+    legacy_json_path = paths["base"].with_suffix(".json")
+    if not legacy_json_path.exists():
+        return []
+
+    try:
+        rows = load_json_file(legacy_json_path)
+    except Exception:
+        print(f"检测到已有 JSON 文件损坏，将从空结果开始：{legacy_json_path}")
+        return []
+
+    if not isinstance(rows, list):
+        print(f"检测到已有 JSON 文件格式不正确，将从空结果开始：{legacy_json_path}")
+        return []
+
+    normalized_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized_rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+
+    return normalized_rows
+
+
+def rewrite_csv(rows, paths):
+    csv_path = paths["csv"]
+    if not rows:
+        if csv_path.exists():
+            csv_path.unlink()
+        return
+
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_csv(rows, paths):
+    if not rows:
+        return
+
+    csv_path = paths["csv"]
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_debug_artifacts(tab, paths, error):
+    current_url = ""
+    if tab is not None:
+        try:
+            current_url = tab.url
+        except Exception:
+            current_url = ""
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_content = [
+        f"时间：{timestamp}",
+        f"当前页面：{current_url}",
+        f"异常类型：{type(error).__name__}",
+        f"异常信息：{error}",
+        "异常堆栈：",
+        traceback.format_exc().rstrip(),
+        "",
+    ]
+    paths["log"].write_text("\n".join(log_content), encoding="utf-8")
+
+    print(f"调试日志已保存：{paths['log']}")
+
+
+def get_or_create_tab(state):
+    tab = state.get("tab")
+    if tab is not None:
+        return tab
+
+    browser = Chromium()
+    tab = browser.new_tab()
+    tab.set.load_mode.none()
+    tab.get("https://www.zhipin.com/")
+    input("如果需要登录或过验证，请先在浏览器中完成，然后回车继续...")
+
+    state["browser"] = browser
+    state["tab"] = tab
+    return tab
+
+
+def reset_listener(tab):
+    try:
+        tab.listen.stop()
+    except Exception:
+        pass
+
+    try:
+        tab.listen.clear()
+    except Exception:
+        pass
+
+    tab.listen.start("joblist.json")
+
+
+def run(args, config, paths, state):
+    target_url = build_target_url(config["keyword"], config["city_code"], config.get("company"))
+    jobs = load_existing_jobs(paths)
+    seen_ids = {job["job_id"] for job in jobs if job.get("job_id")}
+    rewrite_csv(jobs, paths)
+
+    print(f"城市代码文件：{config['city_json_path']}")
+    print(f"当前城市：{config['city_name']}（{config['city_code']}）")
+    if config.get("company"):
+        print(f"当前公司：{config['company']}")
+    else:
+        print(f"当前关键词：{config['keyword']}")
+    print(f"已加载断点缓存：{len(jobs)} 条")
+    print(f"目标链接：{target_url}")
+
+    tab = get_or_create_tab(state)
+    reset_listener(tab)
+    tab.get(target_url)
+
+    empty_scrolls = 0
+    scroll_rounds = 0
+
+    while True:
+        ensure_not_blocked(tab)
+
+        packet = tab.listen.wait(timeout=args.packet_timeout)
+        batch, has_more = parse_packet(packet)
+
+        if batch:
+            empty_scrolls = 0
+            new_count = 0
+            new_rows = []
+
+            for item in batch:
+                job = normalize_job(item)
+                job_id = job["job_id"]
+                if not job_id or job_id in seen_ids:
+                    continue
+
+                if args.fetch_description and job.get("job_description") == "":
+                    print(f"正在抓取职位详情：{job['job_name']}...")
+                    job["job_description"] = fetch_job_description(tab, job_id)
+
+                seen_ids.add(job_id)
+                jobs.append(job)
+                new_rows.append(job)
+                new_count += 1
+
+            print(f"本轮新增 {new_count} 条，累计 {len(jobs)} 条，has_more={has_more}")
+
+            if new_rows:
+                append_csv(new_rows, paths)
+                print(f"已落盘 {len(new_rows)} 条新数据")
+
+            if has_more is False:
+                print("接口返回 has_more=False，停止抓取。")
+                break
+        else:
+            empty_scrolls += 1
+            print(f"本轮未抓到新包，连续空轮次：{empty_scrolls}")
+            if empty_scrolls >= args.max_empty_scrolls:
+                print("连续空轮次已达上限，停止抓取。")
+                break
+
+        if args.max_scroll_rounds > 0 and scroll_rounds >= args.max_scroll_rounds:
+            print(f"已达到最大下拉轮次：{args.max_scroll_rounds}，停止抓取。")
+            break
+
+        scroll_rounds += 1
+        print(f"开始第 {scroll_rounds} 次下拉...")
+        tab.scroll.to_bottom()
+        time.sleep(args.scroll_pause)
+
+    if jobs:
+        print(f"CSV 已保存：{paths['csv']}")
+
+
+def prompt_continue_next_city():
+    while True:
+        print("\n当前城市抓取完成，请选择下一步：")
+        print("1. 继续抓取其他城市（新增数据继续写入当前 CSV 文件）")
+        print("2. 结束抓取并退出程序")
+        choice = input("请输入选项编号 [1/2]：").strip()
+        if choice in {"1", "y", "Y", "yes", "YES", "继续"}:
+            return True
+        if choice in {"", "2", "n", "N", "no", "NO", "结束"}:
+            return False
+        print("输入无效，请输入 1 或 2。")
+
+
+def build_runtime_config(args, city_book=None, keyword=None, company=None, preset_city=None):
+    city_book = city_book or load_city_book()
+    city_name, city_code = prompt_city(args, city_book, preset_city=preset_city)
+
+    if args.keyword is not None:
+        keyword = args.keyword.strip() or DEFAULT_KEYWORD
+        company = None
+    elif args.company is not None:
+        company = args.company.strip()
+        keyword = None
+    else:
+        while True:
+            print("\n请选择搜索方式：")
+            print("1. 按关键词搜索")
+            print("2. 按公司名称搜索")
+            choice = input("请输入选项 [1/2]：").strip()
+            if choice == "1":
+                keyword = prompt_keyword(args)
+                company = None
+                break
+            elif choice == "2":
+                company = prompt_company(args)
+                keyword = None
+                break
+            print("输入无效，请输入 1 或 2。")
+
+    if company:
+        output_prefix = build_output_prefix(args, company)
+    else:
+        output_prefix = build_output_prefix(args, keyword)
+    paths = build_paths(resolve_output_base(output_prefix))
+
+    return {
+        "city_json_path": city_book["path"],
+        "city_name": city_name,
+        "city_code": city_code,
+        "keyword": keyword,
+        "company": company,
+        "paths": paths,
+    }
+
+
+def main():
+    args = parse_args()
+    city_book = load_city_book()
+    config = build_runtime_config(args, city_book=city_book)
+    keyword = config.get("keyword")
+    company = config.get("company")
+    args.city = None
+    state = {"browser": None, "tab": None}
+
+    try:
+        while True:
+            run(args, config, config["paths"], state)
+            if not prompt_continue_next_city():
+                break
+
+            config = build_runtime_config(
+                args,
+                city_book=city_book,
+                keyword=keyword,
+                company=company,
+            )
+    except KeyboardInterrupt as error:
+        print("用户手动中断，正在保存调试信息...")
+        write_debug_artifacts(state["tab"], config["paths"], error)
+        raise SystemExit(1) from error
+    except Exception as error:
+        write_debug_artifacts(state["tab"], config["paths"], error)
+        raise
+
+
+if __name__ == "__main__":
+    main()
 
