@@ -7,7 +7,7 @@
 
 ## 🧩 我的技能百宝箱
 ### 📊 数据分析 & 数据建模
-SQL(达梦/MySQL)｜Python(Pandas/Numpy/Matplotlib)｜FineBI可视化看板
+SQL(MySQL)｜Python(Pandas/Numpy/Matplotlib)｜FineBI可视化看板
 ER图/UML数据流建模｜海量数据清洗｜指标体系搭建｜经营分析报告输出
 
 ### 💻 软件开发
