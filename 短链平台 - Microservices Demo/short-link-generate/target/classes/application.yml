@@ -1,0 +1,108 @@
+server:
+  port: 9001
+  servlet:
+    context-path: /
+  tomcat:
+    threads:
+      max: 400
+      min-spare: 50
+    accept-count: 500
+
+spring:
+  application:
+    name: short-link-generate
+  profiles:
+    active: dev
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: GMT+8
+    default-property-inclusion: non_null
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/short_link?useUnicode=true&characterEncoding=UTF-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+    hikari:
+      pool-name: GenerateHikariCP
+      minimum-idle: 10
+      maximum-pool-size: 50
+      idle-timeout: 30000
+      max-lifetime: 1800000
+      connection-timeout: 30000
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      password:
+      database: 0
+      timeout: 3s
+      lettuce:
+        pool:
+          max-active: 200
+          max-idle: 50
+          min-idle: 10
+          max-wait: 1s
+
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+        namespace: public
+        username: nacos
+        password: nacos
+      config:
+        server-addr: 127.0.0.1:8848
+        namespace: public
+        username: nacos
+        password: nacos
+        file-extension: yaml
+        refresh-enabled: true
+
+# MyBatis-Plus
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.shortlink.generate.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# 短链业务参数
+shortlink:
+  # 短链默认有效期（天），0 表示永不过期
+  default-expire-days: 0
+  # 短码长度（Base62）
+  code-length: 7
+  # 长链→短码 缓存前缀
+  cache-key-prefix: "sl:map:"
+  # 长链哈希缓存前缀（用于幂等去重）
+  url-hash-prefix: "sl:hash:"
+  # 缓存 TTL（秒），0 表示跟随 expire_time
+  cache-ttl-seconds: 86400
+  # 重定向地址前缀（生成短链URL时使用）
+  short-domain: http://s.local/
+
+# Actuator
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+logging:
+  level:
+    root: INFO
+    com.shortlink: DEBUG
+    com.baomidou.mybatisplus: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

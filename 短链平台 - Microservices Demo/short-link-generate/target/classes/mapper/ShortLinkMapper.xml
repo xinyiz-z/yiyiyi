@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.shortlink.generate.mapper.ShortLinkMapper">
+
+    <resultMap id="BaseResultMap" type="com.shortlink.generate.entity.ShortLink">
+        <id     column="id"            property="id"/>
+        <result column="short_code"    property="shortCode"/>
+        <result column="long_url"      property="longUrl"/>
+        <result column="url_hash"      property="urlHash"/>
+        <result column="short_url"     property="shortUrl"/>
+        <result column="expire_time"   property="expireTime"/>
+        <result column="status"        property="status"/>
+        <result column="click_count"   property="clickCount"/>
+        <result column="created_by"    property="createdBy"/>
+        <result column="created_time"  property="createdTime"/>
+        <result column="updated_time"  property="updatedTime"/>
+        <result column="deleted"       property="deleted"/>
+        <result column="version"       property="version"/>
+    </resultMap>
+
+    <sql id="Base_Column_List">
+        id, short_code, long_url, url_hash, short_url,
+        expire_time, status, click_count,
+        created_by, created_time, updated_time, deleted, version
+    </sql>
+
+    <select id="selectByUrlHash" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM t_short_link
+        WHERE url_hash = #{urlHash} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <select id="selectByShortCode" resultMap="BaseResultMap">
+        SELECT <include refid="Base_Column_List"/>
+        FROM t_short_link
+        WHERE short_code = #{shortCode} AND deleted = 0
+        LIMIT 1
+    </select>
+
+    <update id="incrementClickCount">
+        UPDATE t_short_link
+        SET click_count = click_count + #{delta},
+            updated_time = NOW()
+        WHERE short_code = #{shortCode} AND deleted = 0
+    </update>
+
+</mapper>
